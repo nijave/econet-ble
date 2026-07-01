@@ -1,0 +1,10 @@
+{
+  "domain": "rheem_ble",
+  "name": "Rheem HVAC BLE",
+  "codeowners": [],
+  "config_flow": true,
+  "dependencies": ["bluetooth"],
+  "iot_class": "local_polling",
+  "requirements": ["bleak>=0.21.0", "bleak-retry-connector>=3.0.0", "dbus-fast>=1.80.0"],
+  "version": "0.1.0"
+}

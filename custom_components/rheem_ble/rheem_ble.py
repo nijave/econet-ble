@@ -18,6 +18,7 @@ from enum import Enum
 from typing import Optional
 
 from bleak import BleakClient
+from bleak_retry_connector import establish_connection
 
 logger = logging.getLogger(__name__)
 
@@ -487,10 +488,12 @@ class RheemBLEClient:
     RECONNECT_DELAY = 1.0  # seconds between retries (matches app)
 
     def __init__(self, address: str, timeout: float = 10.0,
-                 command_delay: float = 0.1):
+                 command_delay: float = 0.1,
+                 ble_device=None):
         self.address = address
         self.timeout = timeout
         self.command_delay = command_delay
+        self._ble_device = ble_device
         self._client: Optional[BleakClient] = None
         self._response_data = bytearray()
         self._response_event = asyncio.Event()
@@ -502,9 +505,8 @@ class RheemBLEClient:
     def _remove_device_cache(self):
         """Remove device from BlueZ cache to clear stale state.
 
-        This clears leftover notification FDs, bonding keys, and cached
-        services that can cause 'Notify acquired' or 'NotPermitted' errors
-        on reconnection attempts.
+        This clears leftover notification FDs and cached services that can
+        cause 'Notify acquired' or 'NotPermitted' errors on reconnection.
         """
         import subprocess
         try:
@@ -522,25 +524,29 @@ class RheemBLEClient:
         except Exception as e:
             logger.debug("Could not remove device: %s", e)
 
-    async def _ensure_paired(self):
-        """Ensure the device is paired using D-Bus with a NoInputNoOutput agent.
+    async def _register_pairing_agent(self):
+        """Register a NoInputNoOutput BLE pairing agent on the system D-Bus.
 
-        Rheem BLE devices require bonding before allowing GATT operations.
-        The system's default Bluetooth agent (GNOME/KDE) uses DisplayYesNo
-        capability which the device rejects. This method temporarily
-        registers a NoInputNoOutput agent, calls Pair() via D-Bus (which
-        combines connect + pair atomically), then unregisters the agent
-        before bleak connects.
+        The furnace sends an SMP Security Request (kernel: "unexpected SMP
+        command 0x0b") right after the BLE connection is established.  Without
+        a registered agent, BlueZ rejects the request and disconnects the
+        device before any GATT operations can run.  This registers a minimal
+        Just Works agent so BlueZ can complete ephemeral encryption without
+        bonding or an explicit Pair() call.
+
+        Returns (bus, agent_path) on success, (None, None) on failure.  The
+        caller is responsible for calling _unregister_pairing_agent with the
+        returned values.
         """
         try:
             from dbus_fast.aio import MessageBus
             from dbus_fast.service import ServiceInterface, method
-            from dbus_fast import BusType, Variant
+            from dbus_fast import BusType
         except ImportError:
-            logger.debug("dbus-fast not available, skipping D-Bus pairing")
-            return
+            logger.debug("dbus-fast not available; connecting without pairing agent")
+            return None, None
 
-        class PairingAgent(ServiceInterface):
+        class _NoInputNoOutput(ServiceInterface):
             def __init__(self):
                 super().__init__("org.bluez.Agent1")
 
@@ -549,158 +555,192 @@ class RheemBLEClient:
                 pass
 
             @method()
-            def RequestConfirmation(self, device: "o",
-                                     passkey: "u") -> None:
-                logger.debug("Agent: auto-confirm %s passkey=%s",
-                             device, passkey)
+            def RequestConfirmation(self, device: 'o', passkey: 'u') -> None:
+                pass
 
             @method()
-            def AuthorizeService(self, device: "o", uuid: "s") -> None:
-                logger.debug("Agent: auto-authorize %s service %s",
-                             device, uuid)
+            def RequestPinCode(self, device: 'o') -> 's':
+                return ""
+
+            @method()
+            def DisplayPinCode(self, device: 'o', pincode: 's') -> None:
+                pass
+
+            @method()
+            def RequestPasskey(self, device: 'o') -> 'u':
+                return 0
+
+            @method()
+            def DisplayPasskey(self, device: 'o', passkey: 'u', entered: 'q') -> None:
+                pass
+
+            @method()
+            def AuthorizeService(self, device: 'o', uuid: 's') -> None:
+                pass
 
             @method()
             def Cancel(self) -> None:
                 pass
 
-        bus = None
+        agent_path = "/rheem_ble/pairing_agent"
         try:
-            # Step 1: Scan to ensure device is in BlueZ cache
-            from bleak import BleakScanner
-            logger.info("Scanning for %s...", self.address)
-            await BleakScanner.discover(timeout=5.0)
-
-            # Step 2: Register NoInputNoOutput agent
             bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
-            agent_path = "/rheem_diag/agent"
-            bus.export(agent_path, PairingAgent())
+            bus.export(agent_path, _NoInputNoOutput())
 
-            introspect = await bus.introspect("org.bluez", "/org/bluez")
-            proxy = bus.get_proxy_object("org.bluez", "/org/bluez",
-                                         introspect)
+            introspection = await bus.introspect("org.bluez", "/org/bluez")
+            proxy = bus.get_proxy_object("org.bluez", "/org/bluez", introspection)
             agent_mgr = proxy.get_interface("org.bluez.AgentManager1")
-            await agent_mgr.call_register_agent(agent_path,
-                                                 "NoInputNoOutput")
+            await agent_mgr.call_register_agent(agent_path, "NoInputNoOutput")
             await agent_mgr.call_request_default_agent(agent_path)
-            logger.info("Registered NoInputNoOutput pairing agent")
 
-            # Step 3: Get device interface
-            addr_path = self.address.upper().replace(":", "_")
-            device_path = f"/org/bluez/hci0/dev_{addr_path}"
-
-            dev_intro = await bus.introspect("org.bluez", device_path)
-            dev_proxy = bus.get_proxy_object("org.bluez", device_path,
-                                              dev_intro)
-            device = dev_proxy.get_interface("org.bluez.Device1")
-            props = dev_proxy.get_interface(
-                "org.freedesktop.DBus.Properties")
-
-            # Step 4: Check if already paired
-            paired_v = await props.call_get("org.bluez.Device1", "Paired")
-            if paired_v.value:
-                logger.info("Device already paired")
-                await props.call_set("org.bluez.Device1", "Trusted",
-                                      Variant("b", True))
-                try:
-                    await device.call_disconnect()
-                except Exception:
-                    pass
-                await asyncio.sleep(0.1)
-                return
-
-            # Step 5: Pair (combines connect + key exchange)
-            logger.info("D-Bus Pair() to %s...", self.address)
-            try:
-                await asyncio.wait_for(device.call_pair(), timeout=30.0)
-                logger.info("Pairing succeeded")
-            except asyncio.TimeoutError:
-                logger.warning("Pair() timed out")
-                return
-            except Exception as e:
-                if "AlreadyExists" in str(e):
-                    logger.info("Already paired")
-                else:
-                    logger.warning("Pair() error: %s", e)
-                    return
-
-            # Step 6: Trust + disconnect (bleak will reconnect)
-            try:
-                await props.call_set("org.bluez.Device1", "Trusted",
-                                      Variant("b", True))
-            except Exception:
-                pass
-            try:
-                await device.call_disconnect()
-            except Exception:
-                pass
-            await asyncio.sleep(1.0)
-            logger.info("Device paired and trusted, ready for bleak")
-
+            logger.debug("NoInputNoOutput pairing agent registered")
+            return bus, agent_path
         except Exception as e:
-            logger.warning("D-Bus pairing failed: %s", e)
-        finally:
-            # CRITICAL: unregister agent before bleak connects, so the
-            # system agent resumes normal operation during the connection
-            if bus:
-                try:
-                    introspect = await bus.introspect("org.bluez",
-                                                       "/org/bluez")
-                    proxy = bus.get_proxy_object("org.bluez", "/org/bluez",
-                                                  introspect)
-                    mgr = proxy.get_interface("org.bluez.AgentManager1")
-                    await mgr.call_unregister_agent(agent_path)
-                    logger.info("Unregistered pairing agent")
-                except Exception:
-                    pass
-                try:
-                    bus.disconnect()
-                except Exception:
-                    pass
+            logger.warning(
+                "Pairing agent registration failed (%s); connecting without agent", e
+            )
+            return None, None
+
+    async def _unregister_pairing_agent(self, bus, agent_path: str) -> None:
+        """Unregister the pairing agent and close the D-Bus connection."""
+        if bus is None:
+            return
+        try:
+            introspection = await bus.introspect("org.bluez", "/org/bluez")
+            proxy = bus.get_proxy_object("org.bluez", "/org/bluez", introspection)
+            agent_mgr = proxy.get_interface("org.bluez.AgentManager1")
+            await agent_mgr.call_unregister_agent(agent_path)
+        except Exception:
+            pass
+        try:
+            bus.disconnect()
+        except Exception:
+            pass
+
+    async def _pair_via_dbus(self, bus) -> None:
+        """Call BlueZ Pair() to complete SMP key exchange before BleakClient connects.
+
+        The furnace sends an SMP Security Request right after BLE connection.
+        Relying on a registered agent to handle it inline during BleakClient's
+        service discovery is unreliable — BlueZ needs to complete the SMP
+        handshake as the central initiator via an explicit Pair() call first.
+
+        After Pair() succeeds the bond is stored in BlueZ. BleakClient then
+        reconnects and inherits the encrypted session, allowing GATT service
+        discovery to proceed without another SMP exchange.
+
+        The device D-Bus path is derived from ble_device.details["path"] when
+        available (HA always provides this), or found via ObjectManager scan.
+        """
+        if bus is None:
+            return
+
+        try:
+            from dbus_fast import Variant
+        except ImportError:
+            return
+
+        device_path = None
+        if self._ble_device is not None:
+            details = getattr(self._ble_device, 'details', {}) or {}
+            device_path = details.get('path')
+
+        if not device_path:
+            addr_key = self.address.upper().replace(':', '_')
+            try:
+                om_intro = await bus.introspect("org.bluez", "/")
+                om_proxy = bus.get_proxy_object("org.bluez", "/", om_intro)
+                om = om_proxy.get_interface("org.freedesktop.DBus.ObjectManager")
+                objects = await om.call_get_managed_objects()
+                for path in objects:
+                    if addr_key in str(path):
+                        device_path = path
+                        break
+            except Exception as e:
+                logger.debug("ObjectManager lookup failed: %s", e)
+
+        if not device_path:
+            logger.warning(
+                "Cannot find D-Bus path for %s; skipping Pair()", self.address
+            )
+            return
+
+        logger.debug("D-Bus pairing device at %s", device_path)
+        try:
+            dev_intro = await bus.introspect("org.bluez", device_path)
+            dev_proxy = bus.get_proxy_object("org.bluez", device_path, dev_intro)
+            device_iface = dev_proxy.get_interface("org.bluez.Device1")
+            props_iface = dev_proxy.get_interface("org.freedesktop.DBus.Properties")
+
+            paired_var = await props_iface.call_get("org.bluez.Device1", "Paired")
+            already_paired = bool(paired_var.value)
+
+            if not already_paired:
+                logger.debug("Calling Pair() on %s", device_path)
+                await asyncio.wait_for(device_iface.call_pair(), timeout=30.0)
+                logger.info("Paired with %s", self.address)
+            else:
+                logger.debug("Already paired with %s", self.address)
+
+            await props_iface.call_set(
+                "org.bluez.Device1", "Trusted", Variant("b", True)
+            )
+
+            conn_var = await props_iface.call_get("org.bluez.Device1", "Connected")
+            if bool(conn_var.value):
+                await device_iface.call_disconnect()
+                await asyncio.sleep(1.0)
+
+        except asyncio.TimeoutError:
+            logger.warning("Pair() timed out for %s", self.address)
+        except Exception as e:
+            logger.warning(
+                "D-Bus Pair() failed for %s (%s); BleakClient will attempt direct connect",
+                self.address, e,
+            )
 
     async def connect(self):
-        """Connect to the BLE device with retry logic matching the app.
+        """Connect to the BLE device via HA's bluetooth infrastructure.
 
-        First ensures the device is paired via D-Bus (with a temporary
-        NoInputNoOutput agent), then connects via bleak to the bonded
-        device.
+        Sequence:
+        1. Register NoInputNoOutput agent (handles Just Works SMP confirmation).
+        2. Call BlueZ Pair() via D-Bus — forces SMP exchange to complete before
+           BleakClient tries to discover services.
+        3. Disconnect the D-Bus-initiated connection so BleakClient can connect.
+        4. Unregister agent (no longer needed; bond is stored in BlueZ).
+        5. establish_connection() — BleakClient re-uses the stored bond key,
+           link comes up encrypted, GATT service discovery succeeds.
         """
-        await self._ensure_paired()
+        bus, agent_path = await self._register_pairing_agent()
+        try:
+            await self._pair_via_dbus(bus)
+        finally:
+            await self._unregister_pairing_agent(bus, agent_path)
 
-        last_err = None
-        for attempt in range(1, self.MAX_CONNECT_ATTEMPTS + 1):
-            try:
-                logger.info("Connection attempt %d/%d to %s",
-                            attempt, self.MAX_CONNECT_ATTEMPTS, self.address)
-                self._client = BleakClient(self.address, timeout=30.0)
-                await self._client.connect()
-                logger.info("Connected to %s", self.address)
+        device = self._ble_device if self._ble_device is not None else self.address
+        try:
+            self._client = await establish_connection(
+                BleakClient,
+                device,
+                self.address,
+                max_attempts=self.MAX_CONNECT_ATTEMPTS,
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to connect after {self.MAX_CONNECT_ATTEMPTS} attempts: {e}"
+            ) from e
 
-                # Find the NUS (or alternative) characteristics
-                self._find_characteristics()
+        logger.info("Connected to %s", self.address)
+        self._find_characteristics()
 
-                if not self._client.is_connected:
-                    raise RuntimeError("Disconnected after service discovery")
+        if not self._client.is_connected:
+            await self._cleanup()
+            raise RuntimeError("Disconnected after service discovery")
 
-                await self._client.start_notify(
-                    self._notify_uuid, self._notification_handler,
-                )
-                logger.info("Subscribed to notifications on %s",
-                            self._notify_uuid)
-                return  # success
-
-            except Exception as e:
-                last_err = e
-                logger.warning("Attempt %d failed: %s", attempt, e)
-                await self._cleanup()
-                if attempt < self.MAX_CONNECT_ATTEMPTS:
-                    # Clear stale BlueZ state (notification FDs, etc.)
-                    self._remove_device_cache()
-                    await asyncio.sleep(self.RECONNECT_DELAY)
-
-        raise RuntimeError(
-            f"Failed to connect after {self.MAX_CONNECT_ATTEMPTS} attempts: "
-            f"{last_err}"
+        await self._client.start_notify(
+            self._notify_uuid, self._notification_handler,
         )
+        logger.info("Subscribed to notifications on %s", self._notify_uuid)
 
     def _find_characteristics(self):
         """Locate the write and notify characteristics.

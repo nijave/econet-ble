@@ -18,7 +18,10 @@ import logging
 import subprocess
 import sys
 
-from rheem_ble import (
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), "custom_components"))
+from rheem_ble.rheem_ble import (
     RheemBLEClient,
     EquipmentType,
     COMMAND_LABELS,

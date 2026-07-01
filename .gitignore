@@ -205,3 +205,10 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Android app decompiled sources and resources (reference material, not for VCS)
+sources/
+resources/
+
+# Local Claude settings
+.claude/
