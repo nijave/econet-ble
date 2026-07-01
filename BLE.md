@@ -104,6 +104,19 @@ See `rheem_ble.py` for full implementation. Summary:
 | `0x02` | Error: CANNOT_BE_WRITTEN | — |
 | `0x04` | Error: DATA_TYPE_CONFLICT | — |
 
+## Pressure Units
+
+IEEE float responses that represent pressure use different units depending on the physical quantity:
+
+| Command | Unit | Notes |
+|---------|------|-------|
+| `STATIC_P` | inH₂O | Duct static air pressure. Android string resource: `unit_static_pressure = "H2O"`. Typical 0.1–1.0 inH₂O, device-reported max 20. **Not PSI.** |
+| `PRES_SUC` | PSIA | Refrigerant suction pressure (absolute). |
+| `PRESSUCG` | PSIG | Refrigerant suction pressure (gauge). |
+| `PRES_LIQ` | PSIA | Refrigerant liquid-line pressure (absolute). |
+| `PRESLIQG` | PSIG | Refrigerant liquid-line pressure (gauge). |
+| `IDU_SUCP` | PSIA | Indoor unit suction pressure (absolute). |
+
 ## MTU
 
 The Android app requests MTU 517 after service discovery. The Linux implementation does not currently request a custom MTU (BlueZ defaults to 23 bytes). Larger MTU would allow multi-byte packets in a single ATT transaction, but the protocol uses short command names and the default MTU appears sufficient for all known commands.

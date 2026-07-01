@@ -137,12 +137,14 @@ SENSOR_DESCRIPTIONS: dict[str, RheemSensorMetadata] = {
         state_class=SensorStateClass.MEASUREMENT,
         native_unit_of_measurement=UnitOfTemperature.FAHRENHEIT,
     ),
-    # Pressure sensors (psi)
+    # STATIC_P is duct static air pressure in inches of water column (inH₂O),
+    # not PSI. Confirmed from Android app string resource unit_static_pressure="H2O
+    # and live readings (typical 0.1–1.0 inH₂O, device max 20).
     "STATIC_P": RheemSensorMetadata(
         command="STATIC_P",
         device_class=SensorDeviceClass.PRESSURE,
         state_class=SensorStateClass.MEASUREMENT,
-        native_unit_of_measurement=UnitOfPressure.PSI,
+        native_unit_of_measurement=UnitOfPressure.INH2O,
     ),
     "PRES_SUC": RheemSensorMetadata(
         command="PRES_SUC",
